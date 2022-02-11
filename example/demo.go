@@ -18,109 +18,190 @@ import (
 	"crypto/rand"
 	"fmt"
 	"hash/crc32"
-	"log"
 	_ "net/http/pprof"
+	"os"
+	"sync"
 
 	mathrand "math/rand"
-	"net/http"
 	"runtime"
 	"time"
 
+	"github.com/HdrHistogram/hdrhistogram-go"
 	"github.com/hnes/cpuworker"
 )
 
 var glCrc32bs = make([]byte, 1024*256)
 
 func cpuIntensiveTask(amt int) uint32 {
-	//ts := time.Now()
 	var ck uint32
-	for range make([]struct{}, amt) {
+	for i := 0; i < amt; i++ {
 		ck = crc32.ChecksumIEEE(glCrc32bs)
 	}
-	//fmt.Println("log: crc32.ChecksumIEEE time cost (without checkpoint):", time.Now().Sub(ts))
 	return ck
 }
 
 func cpuIntensiveTaskWithCheckpoint(amt int, checkpointFp func()) uint32 {
-	//ts := time.Now()
 	var ck uint32
-	for range make([]struct{}, amt) {
+	for i := 0; i < amt; i++ {
 		ck = crc32.ChecksumIEEE(glCrc32bs)
 		checkpointFp()
 	}
-	//fmt.Println("log: crc32.ChecksumIEEE time cost (with checkpoint):", time.Now().Sub(ts))
 	return ck
 }
 
-func handleChecksumWithoutCpuWorker(w http.ResponseWriter, _ *http.Request) {
-	ts := time.Now()
-	ck := cpuIntensiveTask(10000 + mathrand.Intn(10000))
-	w.Write([]byte(fmt.Sprintln("crc32 (without cpuworker):", ck, "time cost:", time.Now().Sub(ts))))
+const checksumAmt = 100 //00
+
+func checksumWithoutCpuWorker() {
+	cpuIntensiveTask(checksumAmt + mathrand.Intn(checksumAmt))
 }
 
-func handleChecksumWithCpuWorkerAndHasCheckpoint(w http.ResponseWriter, _ *http.Request) {
-	ts := time.Now()
-	var ck uint32
+func checksumWithCpuWorkerAndHasCheckpoint() {
 	cpuworker.Submit1(func(checkpointFp func()) {
-		ck = cpuIntensiveTaskWithCheckpoint(10000+mathrand.Intn(10000), checkpointFp)
+		cpuIntensiveTaskWithCheckpoint(checksumAmt+mathrand.Intn(checksumAmt), checkpointFp)
 	}).Sync()
-	w.Write([]byte(fmt.Sprintln("crc32 (with cpuworker and checkpoint):", ck, "time cost:", time.Now().Sub(ts))))
 }
 
-func handleChecksumSmallTaskWithCpuWorker(w http.ResponseWriter, _ *http.Request) {
-	ts := time.Now()
-	var ck uint32
+func checksumSmallTaskWithCpuWorker() {
 	cpuworker.Submit(func() {
-		ck = cpuIntensiveTask(10)
+		cpuIntensiveTask(10)
 	}).Sync()
-	w.Write([]byte(fmt.Sprintln("crc32 (with cpuworker and small task):", ck, "time cost:", time.Now().Sub(ts))))
 }
 
-func handleDelay(w http.ResponseWriter, _ *http.Request) {
-	t0 := time.Now()
-	wCh := make(chan struct{})
-	go func() {
-		time.Sleep(time.Millisecond)
-		wCh <- struct{}{}
-	}()
-	<-wCh
-	w.Write([]byte(fmt.Sprintf("delayed 1ms, time cost %s :)\n", time.Now().Sub(t0))))
+func delay1ms() {
+	<-time.After(1 * time.Millisecond)
 }
 
-func handleDelayLoop(w http.ResponseWriter, _ *http.Request) {
-	t0 := time.Now()
-	for idx := range make([]byte, 10) {
-		t0 := time.Now()
-		wCh := make(chan struct{})
-		go func() {
-			time.Sleep(time.Millisecond)
-			wCh <- struct{}{}
-		}()
-		<-wCh
-		w.Write([]byte(fmt.Sprintf("delayed 1ms loop, idx:%d , time cost %s :)\n", idx, time.Now().Sub(t0))))
+func delayLoop() {
+	for i := 0; i < 10; i++ {
+		<-time.After(1 * time.Millisecond)
 	}
-	w.Write([]byte(fmt.Sprintf("delayed 1ms loop, final , total time cost %s :)\n", time.Now().Sub(t0))))
 }
 
-func handleDelayLoopWithCpuWorker(w http.ResponseWriter, _ *http.Request) {
+func delayLoopWithCpuWorker() {
 	cpuworker.Submit3(func(eventCall func(func())) {
-		t0 := time.Now()
-		for idx := range make([]byte, 10) {
-			t0 := time.Now()
-			wCh := make(chan struct{})
-			go func() {
-				time.Sleep(time.Millisecond)
-				wCh <- struct{}{}
-			}()
+		for i := 0; i < 10; i++ {
 			eventCall(func() {
-				<-wCh
-				w.Write([]byte(fmt.Sprintf("delayed 1ms loop with cpuworker, idx:%d , time cost %s :)\n", idx, time.Now().Sub(t0))))
+				<-time.After(1 * time.Millisecond)
 			})
 		}
-		eventCall(func() {
-			w.Write([]byte(fmt.Sprintf("delayed 1ms loop with cpuworker, final , total time cost %s :)\n", time.Now().Sub(t0))))
-		})
 	}, 0, true).Sync()
+}
+
+func runScenario(delayUS *hdrhistogram.Histogram, f func(), conc, count int) {
+	tokenCh := make(chan struct{}, conc)
+	for i := 0; i < conc; i++ {
+		tokenCh <- struct{}{}
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(count)
+
+	delayCh := make(chan int64, conc)
+	go func() {
+		defer close(delayCh)
+		wg.Wait()
+	}()
+
+	go func() {
+		for i := 0; i < count; i++ {
+			<-tokenCh
+			go func() {
+				defer func() { tokenCh <- struct{}{} }()
+				defer wg.Done()
+				start := time.Now()
+				f()
+				delayCh <- int64(time.Now().Sub(start) / time.Microsecond)
+			}()
+		}
+	}()
+
+	for delay := range delayCh {
+		delayUS.RecordValue(delay)
+	}
+}
+
+func scenario1(count int) []*hdrhistogram.Histogram {
+	fmt.Printf("Running scenario 1 (delay1ms) count=%d\n", count)
+
+	delayUS := hdrhistogram.New(1, 10000000, 2)
+	runScenario(delayUS, delay1ms, 100, count)
+
+	return []*hdrhistogram.Histogram{delayUS}
+}
+
+func scenario2(count int) []*hdrhistogram.Histogram {
+	fmt.Printf("Running scenario 2 (delay1ms and checksumWithoutCpuWorker) count=%d\n", count)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	delayUS1 := hdrhistogram.New(1, 10000000, 2)
+	go func() {
+		defer wg.Done()
+		runScenario(delayUS1, delay1ms, 100, count)
+	}()
+
+	delayUS2 := hdrhistogram.New(1, 10000000, 2)
+	go func() {
+		defer wg.Done()
+		runScenario(delayUS2, checksumWithoutCpuWorker, 100, count)
+	}()
+
+	wg.Wait()
+
+	return []*hdrhistogram.Histogram{delayUS1}
+}
+
+func scenario3(count int) []*hdrhistogram.Histogram {
+	fmt.Printf("Running scenario 3 (delay1ms and checksumWithCpuWorkerAndHasCheckpoint) count=%d\n", count)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	delayUS1 := hdrhistogram.New(1, 10000000, 2)
+	go func() {
+		defer wg.Done()
+		runScenario(delayUS1, delay1ms, 100, count)
+	}()
+
+	delayUS2 := hdrhistogram.New(1, 10000000, 2)
+	go func() {
+		defer wg.Done()
+		runScenario(delayUS2, checksumWithCpuWorkerAndHasCheckpoint, 100, count)
+	}()
+
+	wg.Wait()
+
+	return []*hdrhistogram.Histogram{delayUS1}
+}
+
+func scenario4(count int) []*hdrhistogram.Histogram {
+	fmt.Printf("Running scenario 4 (delay1ms, checksumWithCpuWorkerAndHasCheckpoint and checksumSmallTaskWithCpuWorker) count=%d\n", count)
+
+	var wg sync.WaitGroup
+	wg.Add(3)
+
+	delayUS1 := hdrhistogram.New(1, 10000000, 2)
+	go func() {
+		defer wg.Done()
+		runScenario(delayUS1, delay1ms, 100, count)
+	}()
+
+	delayUS2 := hdrhistogram.New(1, 10000000, 2)
+	go func() {
+		defer wg.Done()
+		runScenario(delayUS2, checksumWithCpuWorkerAndHasCheckpoint, 100, count)
+	}()
+
+	delayUS3 := hdrhistogram.New(1, 10000000, 2)
+	go func() {
+		defer wg.Done()
+		runScenario(delayUS3, checksumSmallTaskWithCpuWorker, 100, count)
+	}()
+
+	wg.Wait()
+
+	return []*hdrhistogram.Histogram{delayUS1, delayUS3}
 }
 
 func main() {
@@ -129,11 +210,16 @@ func main() {
 	cpuP := cpuworker.GetGlobalWorkers().GetMaxP()
 	fmt.Println("GOMAXPROCS:", nCPU, "DefaultMaxTimeSlice:", cpuworker.DefaultMaxTimeSlice,
 		"cpuWorkerMaxP:", cpuP, "length of crc32 bs:", len(glCrc32bs))
-	http.HandleFunc("/checksumWithCpuWorker", handleChecksumWithCpuWorkerAndHasCheckpoint)
-	http.HandleFunc("/checksumSmallTaskWithCpuWorker", handleChecksumSmallTaskWithCpuWorker)
-	http.HandleFunc("/checksumWithoutCpuWorker", handleChecksumWithoutCpuWorker)
-	http.HandleFunc("/delay1ms", handleDelay)
-	http.HandleFunc("/delay1msLoop", handleDelayLoop)
-	http.HandleFunc("/delay1msLoopWithCpuWorker", handleDelayLoopWithCpuWorker)
-	log.Fatal(http.ListenAndServe(":8080", nil))
+
+	for _, fun := range []func(int) []*hdrhistogram.Histogram{scenario1, scenario2, scenario3, scenario4} {
+		fmt.Println()
+
+		start := time.Now()
+		histos := fun(100000 * cpuP / 12)
+
+		for _, histo := range histos {
+			histo.PercentilesPrint(os.Stdout, 1, 1)
+		}
+		fmt.Printf("Total time: %v\n", time.Now().Sub(start))
+	}
 }
