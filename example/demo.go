@@ -49,7 +49,7 @@ func cpuIntensiveTaskWithCheckpoint(amt int, checkpointFp func()) uint32 {
 	return ck
 }
 
-const checksumAmt = 100 //00
+const checksumAmt = 10000
 
 func checksumWithoutCpuWorker() {
 	cpuIntensiveTask(checksumAmt + mathrand.Intn(checksumAmt))
@@ -215,7 +215,7 @@ func main() {
 		fmt.Println()
 
 		start := time.Now()
-		histos := fun(100000 * cpuP / 12)
+		histos := fun(10000000 * cpuP / 12)
 
 		for _, histo := range histos {
 			histo.PercentilesPrint(os.Stdout, 1, 1)
